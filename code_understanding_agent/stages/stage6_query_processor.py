@@ -3,46 +3,123 @@ import os
 import json
 import re
 from typing import Dict, List, Any, Tuple
+from loguru import logger
+
 from utils.file_utils import load_json
-from utils.qwen_api import QwenAPI
+from utils.qwen_api import qwen_api
+from utils.vector_db import vector_db
 
 
 class QueryProcessor:
     def __init__(self, stage5_output_file: str):
-        self.semantic_index = load_json(stage5_output_file)
-        self.knowledge_graph = load_json(stage5_output_file.replace("stage5", "stage4"))
-        self.qwen_api = QwenAPI()
+        self.project_data = load_json(stage5_output_file)
+        self.project_name = self.project_data.get("project_name", "unknown")
+        
+        # 尝试加载知识图谱（如果存在）
+        try:
+            kg_file = stage5_output_file.replace("stage5", "stage4")
+            if os.path.exists(kg_file):
+                self.knowledge_graph = load_json(kg_file)
+            else:
+                self.knowledge_graph = {"nodes": {}, "edges": []}
+        except:
+            self.knowledge_graph = {"nodes": {}, "edges": []}
 
     def process_query(self, user_query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
         """处理用户查询"""
-        print(f"处理查询: {user_query}")
+        logger.info(f"处理查询: {user_query}")
 
-        # 1. 查询理解
-        query_analysis = self.analyze_query(user_query)
-
-        # 2. 意图识别
-        intent = self.identify_intent(user_query, query_analysis)
-
-        # 3. 实体提取
-        entities = self.extract_entities(user_query, query_analysis)
-
-        # 4. 检索策略选择
-        retrieval_strategy = self.select_retrieval_strategy(intent, entities)
-
-        # 5. 执行检索
-        retrieval_results = self.execute_retrieval(retrieval_strategy, entities, context)
-
-        # 6. 结果排序
-        ranked_results = self.rank_results(retrieval_results, intent, user_query)
-
-        return {
-            "query_analysis": query_analysis,
-            "intent": intent,
-            "entities": entities,
-            "retrieval_strategy": retrieval_strategy,
-            "retrieval_results": retrieval_results,
-            "ranked_results": ranked_results
-        }
+        try:
+            # 1. 使用向量数据库进行语义搜索
+            search_results = vector_db.search_similar_code(
+                query=user_query,
+                n_results=10,
+                filters=context.get('filters') if context else None
+            )
+            
+            # 2. 简化的意图识别
+            intent = self.identify_intent(user_query)
+            
+            # 3. 格式化搜索结果
+            formatted_results = self.format_search_results(search_results, intent)
+            
+            return {
+                "query": user_query,
+                "intent": intent,
+                "context": formatted_results,
+                "total_results": len(search_results),
+                "search_enabled": True
+            }
+            
+        except Exception as e:
+            logger.error(f"查询处理失败: {e}")
+            return {
+                "query": user_query,
+                "intent": "GENERAL_QUERY",
+                "context": [],
+                "total_results": 0,
+                "search_enabled": False,
+                "error": str(e)
+            }
+    
+    def identify_intent(self, user_query: str) -> str:
+        """简化的意图识别"""
+        query_lower = user_query.lower()
+        
+        # 意图分类
+        if any(word in query_lower for word in ['实现', '怎么实现', '如何实现', 'implementation', 'implement']):
+            return "FIND_IMPLEMENTATION"
+        elif any(word in query_lower for word in ['定义', '在哪里定义', 'definition', 'define']):
+            return "FIND_DEFINITION"
+        elif any(word in query_lower for word in ['做什么', '功能', '作用', 'what does', 'function']):
+            return "EXPLAIN_FUNCTION"
+        elif any(word in query_lower for word in ['使用', '调用', 'usage', 'use', 'call']):
+            return "FIND_USAGE"
+        elif any(word in query_lower for word in ['关系', '依赖', '关联', 'relation', 'dependency']):
+            return "SHOW_RELATIONS"
+        elif any(word in query_lower for word in ['跳转', '转到', '查看', 'navigate', 'go to']):
+            return "NAVIGATE_CODE"
+        else:
+            return "GENERAL_QUERY"
+    
+    def format_search_results(self, search_results: List[Dict[str, Any]], intent: str) -> List[Dict[str, Any]]:
+        """格式化搜索结果"""
+        formatted_results = []
+        
+        for result in search_results:
+            formatted_result = {
+                "id": result.get("id", ""),
+                "content": result.get("content", ""),
+                "metadata": result.get("metadata", {}),
+                "similarity": result.get("similarity", 0.0),
+                "relevance_score": self.calculate_relevance_score(result, intent)
+            }
+            formatted_results.append(formatted_result)
+        
+        # 根据相关性分数排序
+        formatted_results.sort(key=lambda x: x["relevance_score"], reverse=True)
+        
+        return formatted_results
+    
+    def calculate_relevance_score(self, result: Dict[str, Any], intent: str) -> float:
+        """计算相关性分数"""
+        base_score = result.get("similarity", 0.0)
+        metadata = result.get("metadata", {})
+        
+        # 根据意图调整分数
+        if intent == "FIND_IMPLEMENTATION" and metadata.get("chunk_type") == "function":
+            base_score *= 1.2
+        elif intent == "EXPLAIN_FUNCTION" and metadata.get("chunk_type") == "function":
+            base_score *= 1.1
+        elif intent == "FIND_DEFINITION" and metadata.get("chunk_type") in ["class", "function"]:
+            base_score *= 1.15
+        
+        # 根据复杂度调整分数（复杂度高的可能更重要）
+        complexity = metadata.get("complexity", 0)
+        if complexity > 10:
+            base_score *= 1.05
+        
+        return min(base_score, 1.0)  # 确保分数不超过1.0
 
     def analyze_query(self, user_query: str) -> Dict[str, Any]:
         """分析查询"""
@@ -451,5 +528,22 @@ class QueryProcessor:
 
 def run_stage6_query(stage5_output_file: str, user_query: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
     """运行第六阶段：查询处理"""
-    processor = QueryProcessor(stage5_output_file)
-    return processor.process_query(user_query, context)
+    logger.info(f"开始查询处理: {user_query}")
+    
+    try:
+        processor = QueryProcessor(stage5_output_file)
+        result = processor.process_query(user_query, context)
+        
+        logger.info(f"查询处理完成，找到 {result.get('total_results', 0)} 个结果")
+        return result
+        
+    except Exception as e:
+        logger.error(f"查询处理失败: {e}")
+        return {
+            "query": user_query,
+            "intent": "GENERAL_QUERY",
+            "context": [],
+            "total_results": 0,
+            "search_enabled": False,
+            "error": str(e)
+        }

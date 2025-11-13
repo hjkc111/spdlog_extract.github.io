@@ -3,38 +3,104 @@ import os
 import json
 import numpy as np
 from typing import Dict, List, Any
+from datetime import datetime
+from loguru import logger
+
 from utils.file_utils import load_json, save_json
-from utils.qwen_api import QwenAPI
+from utils.qwen_api import qwen_api
+from utils.vector_db import vector_db, code_chunker
+from config.settings import settings
 
 
 class SemanticEmbedder:
-    def __init__(self, stage4_output_file: str, output_dir: str = "data/processed"):
+    def __init__(self, stage4_output_file: str, output_dir: str = None):
         self.knowledge_graph = load_json(stage4_output_file)
-        self.output_dir = output_dir
-        self.qwen_api = QwenAPI()
+        self.output_dir = output_dir or str(settings.PROCESSED_DIR)
+        self.project_name = self.knowledge_graph.get("metadata", {}).get("project", "unknown")
 
     def generate_semantic_embeddings(self) -> Dict[str, Any]:
-        """生成语义嵌入"""
-        print("生成语义嵌入...")
-
-        embeddings = {}
-
-        # 为每个节点生成嵌入
+        """生成语义嵌入并存储到向量数据库"""
+        logger.info("开始生成语义嵌入...")
+        
+        # 准备代码块数据
+        code_chunks = []
+        
+        # 处理函数节点
         for node_id, node_info in self.knowledge_graph["nodes"].items():
-            embedding = self.generate_node_embedding(node_info)
-            embeddings[node_id] = embedding
-
-        # 为边生成嵌入
-        edge_embeddings = {}
-        for i, edge in enumerate(self.knowledge_graph["edges"]):
-            edge_embedding = self.generate_edge_embedding(edge)
-            edge_embeddings[f"edge_{i}"] = edge_embedding
-
+            if node_info.get("type") == "function":
+                chunks = self.process_function_node(node_id, node_info)
+                code_chunks.extend(chunks)
+            elif node_info.get("type") == "class":
+                chunks = self.process_class_node(node_id, node_info)
+                code_chunks.extend(chunks)
+        
+        # 添加到向量数据库
+        if code_chunks:
+            logger.info(f"向向量数据库添加 {len(code_chunks)} 个代码块...")
+            success = vector_db.add_code_chunks(code_chunks)
+            if success:
+                logger.info("代码块已成功添加到向量数据库")
+            else:
+                logger.error("添加代码块到向量数据库失败")
+        
+        # 获取统计信息
+        stats = vector_db.get_collection_stats()
+        
         return {
-            "node_embeddings": embeddings,
-            "edge_embeddings": edge_embeddings,
-            "embedding_dimension": 512  # 假设的维度
+            "chunks_processed": len(code_chunks),
+            "total_chunks_in_db": stats.get("total_chunks", 0),
+            "embedding_model": stats.get("embedding_model", "unknown"),
+            "embedding_dimension": stats.get("embedding_dimension", 384)
         }
+    
+    def process_function_node(self, node_id: str, node_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """处理函数节点"""
+        chunks = []
+        
+        # 获取函数的语义分析结果
+        semantic_info = node_info.get("semantic", {})
+        
+        # 构建函数信息
+        function_data = {
+            "name": node_info.get("name", ""),
+            "file_path": node_info.get("file_path", ""),
+            "content": node_info.get("content", ""),
+            "line_start": node_info.get("line_start", 0),
+            "line_end": node_info.get("line_end", 0),
+            "return_type": node_info.get("return_type", ""),
+            "parameters": node_info.get("parameters", []),
+            "complexity": semantic_info.get("complexity", 0),
+            "comments": node_info.get("comments", ""),
+            "class_name": node_info.get("class_name", "")
+        }
+        
+        # 使用代码分块器处理函数
+        function_chunks = code_chunker.chunk_function(function_data)
+        chunks.extend(function_chunks)
+        
+        return chunks
+    
+    def process_class_node(self, node_id: str, node_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """处理类节点"""
+        chunks = []
+        
+        # 构建类信息
+        class_data = {
+            "name": node_info.get("name", ""),
+            "file_path": node_info.get("file_path", ""),
+            "declaration": node_info.get("content", ""),
+            "line_start": node_info.get("line_start", 0),
+            "line_end": node_info.get("line_end", 0),
+            "members": node_info.get("members", []),
+            "methods": node_info.get("methods", []),
+            "comments": node_info.get("comments", "")
+        }
+        
+        # 使用代码分块器处理类
+        class_chunks = code_chunker.chunk_class(class_data)
+        chunks.extend(class_chunks)
+        
+        return chunks
 
     def generate_node_embedding(self, node_info: Dict[str, Any]) -> Dict[str, Any]:
         """生成节点嵌入"""
@@ -237,23 +303,86 @@ class SemanticEmbedder:
 
         return search_index
 
-    def save_stage_output(self, semantic_index: Dict[str, Any]) -> str:
+    def save_stage_output(self, embedding_stats: Dict[str, Any]) -> str:
         """保存阶段输出"""
+        # 获取向量数据库统计信息
+        vector_stats = vector_db.get_collection_stats()
+        
         output_data = {
-            "semantic_index": semantic_index,
-            "knowledge_graph_reference": self.knowledge_graph["metadata"]["project"]
+            "project_name": self.project_name,
+            "project_path": self.knowledge_graph.get("metadata", {}).get("project_path", ""),
+            "analysis_time": datetime.now().isoformat(),
+            "embedding_stats": embedding_stats,
+            "vector_db_stats": vector_stats,
+            "knowledge_graph_reference": self.knowledge_graph.get("metadata", {}),
+            "files": self.extract_file_summary(),
+            "search_enabled": True,
+            "version": "2.0"
         }
 
-        output_file = os.path.join(self.output_dir, "stage5_semantic_index.json")
+        # 生成带时间戳的文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = os.path.join(self.output_dir, f"stage5_{self.project_name}_{timestamp}.json")
+        
         save_json(output_data, output_file)
-        print(f"阶段5输出已保存: {output_file}")
+        logger.info(f"阶段5输出已保存: {output_file}")
         return output_file
+    
+    def extract_file_summary(self) -> List[Dict[str, Any]]:
+        """提取文件摘要信息"""
+        files_summary = []
+        
+        # 从知识图谱中提取文件信息
+        for node_id, node_info in self.knowledge_graph.get("nodes", {}).items():
+            if node_info.get("type") == "file":
+                file_info = {
+                    "path": node_info.get("file_path", ""),
+                    "line_count": node_info.get("line_count", 0),
+                    "functions": [],
+                    "classes": []
+                }
+                files_summary.append(file_info)
+        
+        # 添加函数和类信息
+        for node_id, node_info in self.knowledge_graph.get("nodes", {}).items():
+            node_type = node_info.get("type")
+            file_path = node_info.get("file_path", "")
+            
+            # 找到对应的文件
+            for file_info in files_summary:
+                if file_info["path"] == file_path:
+                    if node_type == "function":
+                        file_info["functions"].append({
+                            "name": node_info.get("name", ""),
+                            "line_start": node_info.get("line_start", 0),
+                            "line_end": node_info.get("line_end", 0),
+                            "complexity": node_info.get("semantic", {}).get("complexity", 0),
+                            "parameters": node_info.get("parameters", [])
+                        })
+                    elif node_type == "class":
+                        file_info["classes"].append({
+                            "name": node_info.get("name", ""),
+                            "line_start": node_info.get("line_start", 0),
+                            "line_end": node_info.get("line_end", 0),
+                            "members": node_info.get("members", []),
+                            "methods": node_info.get("methods", [])
+                        })
+        
+        return files_summary
 
 
 def run_stage5(stage4_output_file: str) -> str:
     """运行第五阶段：语义嵌入"""
-    embedder = SemanticEmbedder(stage4_output_file)
-    embeddings = embedder.generate_semantic_embeddings()
-    semantic_index = embedder.build_semantic_index(embeddings)
-    output_file = embedder.save_stage_output(semantic_index)
-    return output_file
+    logger.info("开始运行阶段5：语义嵌入")
+    
+    try:
+        embedder = SemanticEmbedder(stage4_output_file)
+        embedding_stats = embedder.generate_semantic_embeddings()
+        output_file = embedder.save_stage_output(embedding_stats)
+        
+        logger.info(f"阶段5完成，处理了 {embedding_stats.get('chunks_processed', 0)} 个代码块")
+        return output_file
+        
+    except Exception as e:
+        logger.error(f"阶段5执行失败: {e}")
+        raise

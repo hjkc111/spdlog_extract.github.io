@@ -2,50 +2,150 @@
 import os
 import json
 from typing import Dict, List, Any
+from loguru import logger
+
 from utils.file_utils import load_json
-from utils.qwen_api import QwenAPI
+from utils.qwen_api import qwen_api
 
 
 class AnswerGenerator:
     def __init__(self, stage5_output_file: str):
-        self.semantic_index = load_json(stage5_output_file)
-        self.knowledge_graph = load_json(stage5_output_file.replace("stage5", "stage4"))
-        self.qwen_api = QwenAPI()
+        self.project_data = load_json(stage5_output_file)
+        self.project_name = self.project_data.get("project_name", "unknown")
+        
+        # 尝试加载知识图谱（如果存在）
+        try:
+            kg_file = stage5_output_file.replace("stage5", "stage4")
+            if os.path.exists(kg_file):
+                self.knowledge_graph = load_json(kg_file)
+            else:
+                self.knowledge_graph = {"nodes": {}, "edges": []}
+        except:
+            self.knowledge_graph = {"nodes": {}, "edges": []}
 
     def generate_answer(self, query_processing_result: Dict[str, Any], user_query: str) -> Dict[str, Any]:
         """生成答案"""
-        print("生成答案...")
+        logger.info("开始生成答案...")
 
-        ranked_results = query_processing_result["ranked_results"]
-        intent = query_processing_result["intent"]
-        query_analysis = query_processing_result["query_analysis"]
+        context = query_processing_result.get("context", [])
+        intent = query_processing_result.get("intent", "GENERAL_QUERY")
 
-        if not ranked_results:
-            return self.generate_no_results_answer(user_query, query_analysis)
+        if not context:
+            return self.generate_no_results_answer(user_query)
 
-        # 根据意图生成不同类型的答案
-        if intent == "FIND_IMPLEMENTATION":
-            answer = self.generate_implementation_answer(ranked_results, user_query, query_analysis)
-        elif intent == "EXPLAIN_FUNCTION":
-            answer = self.generate_explanation_answer(ranked_results, user_query, query_analysis)
-        elif intent == "FIND_DEFINITION":
-            answer = self.generate_definition_answer(ranked_results, user_query, query_analysis)
-        elif intent == "FIND_USAGE":
-            answer = self.generate_usage_answer(ranked_results, user_query, query_analysis)
-        elif intent == "SHOW_RELATIONS":
-            answer = self.generate_relations_answer(ranked_results, user_query, query_analysis)
-        else:
-            answer = self.generate_general_answer(ranked_results, user_query, query_analysis)
-
-        # 添加元数据
-        answer["metadata"] = {
-            "query_intent": intent,
-            "results_count": len(ranked_results),
-            "user_knowledge_level": query_analysis.get("user_knowledge_level", "intermediate"),
-            "confidence_score": self.calculate_confidence(ranked_results)
+        try:
+            # 使用Qwen API生成答案
+            answer_data = qwen_api.answer_code_question(user_query, context)
+            
+            # 添加额外的导航信息
+            navigation_info = self.extract_navigation_info(context)
+            if navigation_info:
+                answer_data["navigation"] = navigation_info
+            
+            # 添加元数据
+            answer_data["metadata"] = {
+                "query_intent": intent,
+                "results_count": len(context),
+                "confidence_score": self.calculate_confidence(context),
+                "project_name": self.project_name
+            }
+            
+            logger.info("答案生成完成")
+            return answer_data
+            
+        except Exception as e:
+            logger.error(f"答案生成失败: {e}")
+            return self.generate_fallback_answer(user_query, context)
+    
+    def generate_no_results_answer(self, user_query: str) -> Dict[str, Any]:
+        """生成无结果答案"""
+        return {
+            "answer": f"抱歉，我没有找到与 '{user_query}' 相关的代码信息。请尝试使用不同的关键词或更具体的描述。",
+            "key_points": [
+                "没有找到相关的代码片段",
+                "建议尝试不同的搜索关键词",
+                "可以尝试更具体的函数名或类名"
+            ],
+            "code_examples": [],
+            "related_functions": [],
+            "implementation_steps": [],
+            "navigation": []
         }
-
-        return answer
+    
+    def generate_fallback_answer(self, user_query: str, context: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """生成回退答案"""
+        # 提取一些基本信息
+        file_paths = set()
+        function_names = set()
+        
+        for ctx in context[:3]:  # 只看前3个结果
+            metadata = ctx.get("metadata", {})
+            if metadata.get("file_path"):
+                file_paths.add(metadata["file_path"])
+            if metadata.get("function_name"):
+                function_names.add(metadata["function_name"])
+        
+        answer = f"基于代码分析，我找到了与 '{user_query}' 相关的代码片段。"
+        
+        if function_names:
+            answer += f" 主要涉及函数：{', '.join(list(function_names)[:3])}。"
+        
+        if file_paths:
+            answer += f" 相关文件：{', '.join(list(file_paths)[:2])}。"
+        
+        return {
+            "answer": answer,
+            "key_points": [
+                f"找到 {len(context)} 个相关代码片段",
+                f"涉及 {len(file_paths)} 个文件",
+                f"包含 {len(function_names)} 个函数"
+            ],
+            "code_examples": [
+                {
+                    "description": "相关代码片段",
+                    "code": context[0].get("content", "")[:200] + "..." if context else ""
+                }
+            ],
+            "related_functions": list(function_names)[:5],
+            "implementation_steps": [],
+            "navigation": self.extract_navigation_info(context)
+        }
+    
+    def extract_navigation_info(self, context: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """提取导航信息"""
+        navigation = []
+        
+        for ctx in context[:5]:  # 只取前5个
+            metadata = ctx.get("metadata", {})
+            
+            if metadata.get("function_name"):
+                navigation.append({
+                    "name": metadata["function_name"],
+                    "type": "function",
+                    "location": f"{metadata.get('file_path', 'unknown')}:{metadata.get('line_start', 0)}"
+                })
+            elif metadata.get("class_name"):
+                navigation.append({
+                    "name": metadata["class_name"],
+                    "type": "class",
+                    "location": f"{metadata.get('file_path', 'unknown')}:{metadata.get('line_start', 0)}"
+                })
+        
+        return navigation
+    
+    def calculate_confidence(self, context: List[Dict[str, Any]]) -> float:
+        """计算置信度分数"""
+        if not context:
+            return 0.0
+        
+        # 基于相似度分数计算平均置信度
+        similarities = [ctx.get("similarity", 0.0) for ctx in context]
+        avg_similarity = sum(similarities) / len(similarities)
+        
+        # 考虑结果数量的影响
+        count_factor = min(len(context) / 5.0, 1.0)  # 5个结果为满分
+        
+        return min(avg_similarity * count_factor, 1.0)
 
     def generate_implementation_answer(self, results: List[Dict[str, Any]], user_query: str,
                                        query_analysis: Dict[str, Any]) -> Dict[str, Any]:
@@ -611,8 +711,25 @@ class AnswerGenerator:
         }
 
 
-def run_stage7_answer(stage5_output_file: str, query_processing_result: Dict[str, Any], user_query: str) -> Dict[
-    str, Any]:
+def run_stage7_answer(stage5_output_file: str, query_processing_result: Dict[str, Any], user_query: str) -> Dict[str, Any]:
     """运行第七阶段：答案生成"""
-    generator = AnswerGenerator(stage5_output_file)
-    return generator.generate_answer(query_processing_result, user_query)
+    logger.info("开始运行阶段7：答案生成")
+    
+    try:
+        generator = AnswerGenerator(stage5_output_file)
+        answer = generator.generate_answer(query_processing_result, user_query)
+        
+        logger.info("阶段7完成：答案生成成功")
+        return answer
+        
+    except Exception as e:
+        logger.error(f"阶段7执行失败: {e}")
+        return {
+            "answer": f"抱歉，生成答案时出现错误: {str(e)}",
+            "key_points": [],
+            "code_examples": [],
+            "related_functions": [],
+            "implementation_steps": [],
+            "navigation": [],
+            "error": str(e)
+        }
